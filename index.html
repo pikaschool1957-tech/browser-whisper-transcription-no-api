@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#10131a">
+  <title>Browser Whisper Transcription</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #10131a;
+      color: #eef1f8;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 28px 16px;
+      background: radial-gradient(ellipse at 50% 0%, #26314a 0, transparent 55%), #10131a;
+    }
+
+    main {
+      width: min(100%, 720px);
+      padding: clamp(24px, 5vw, 44px);
+      border: 1px solid #30394c;
+      border-radius: 20px;
+      background: #171c27;
+      box-shadow: 0 24px 80px #0005;
+    }
+
+    .tag {
+      display: inline-block;
+      padding: 6px 10px;
+      border: 1px solid #3b705e;
+      border-radius: 999px;
+      color: #9ce0bf;
+      font-size: .8rem;
+      font-weight: 650;
+    }
+
+    h1 { margin: 18px 0 8px; font-size: clamp(2rem, 6vw, 3rem); }
+    p { color: #b6bfd0; line-height: 1.6; }
+
+    .drop-zone {
+      display: grid;
+      gap: 12px;
+      place-items: center;
+      margin: 26px 0 18px;
+      padding: 30px 18px;
+      border: 1px dashed #596780;
+      border-radius: 14px;
+      background: #1c2330;
+      text-align: center;
+    }
+
+    input[type="file"] { max-width: 100%; color: #cbd3e1; }
+
+    button {
+      width: 100%;
+      padding: 13px 18px;
+      border: 0;
+      border-radius: 10px;
+      background: #8b9cff;
+      color: #111522;
+      font: inherit;
+      font-weight: 750;
+      cursor: pointer;
+    }
+
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    #status { min-height: 1.6em; margin: 16px 0 8px; font-size: .95rem; }
+    progress { width: 100%; height: 8px; accent-color: #9ce0bf; }
+
+    textarea {
+      width: 100%;
+      min-height: 220px;
+      margin-top: 12px;
+      padding: 14px;
+      resize: vertical;
+      border: 1px solid #30394c;
+      border-radius: 10px;
+      background: #10131a;
+      color: #eef1f8;
+      font: inherit;
+      line-height: 1.6;
+    }
+
+    .note { margin-top: 20px; font-size: .85rem; }
+    .error { color: #ffaaa8; }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="tag">Private by design · Runs in your browser</span>
+    <h1>Browser Whisper Transcription</h1>
+    <p>
+      Transcribe an audio file with Whisper running on your device.
+      No API key or transcription server required. The model is downloaded
+      the first time you transcribe.
+    </p>
+
+    <label class="drop-zone" for="audio-file">
+      <strong>Choose an audio file</strong>
+      <span>For example: WAV, MP3, M4A, or OGG</span>
+      <input id="audio-file" type="file" accept="audio/*">
+    </label>
+
+    <button id="transcribe" type="button" disabled>Transcribe audio</button>
+    <p id="status" role="status" aria-live="polite">Choose an audio file to begin.</p>
+    <progress id="progress" value="0" max="100" hidden></progress>
+
+    <label for="transcript"><strong>Transcript</strong></label>
+    <textarea id="transcript" placeholder="Your transcript will appear here…" spellcheck="false"></textarea>
+
+    <p class="note">
+      Audio is processed locally in your browser. The Whisper model files are
+      fetched from Hugging Face when needed. Performance depends on your device.
+    </p>
+  </main>
+
+  <script type="module">
+    const fileInput = document.querySelector("#audio-file");
+    const button = document.querySelector("#transcribe");
+    const status = document.querySelector("#status");
+    const progress = document.querySelector("#progress");
+    const transcript = document.querySelector("#transcript");
+
+    let transcriberPromise;
+
+    fileInput.addEventListener("change", () => {
+      button.disabled = !fileInput.files?.length;
+      transcript.value = "";
+      status.textContent = fileInput.files?.length
+        ? `Ready: ${fileInput.files[0].name}`
+        : "Choose an audio file to begin.";
+      status.classList.remove("error");
+    });
+
+    async function getTranscriber() {
+      if (!transcriberPromise) {
+        transcriberPromise = (async () => {
+          const { pipeline, env } = await import(
+            "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3"
+          );
+
+          env.allowLocalModels = false;
+
+          return pipeline("automatic-speech-recognition", "Xenova/whisper-tiny", {
+            progress_callback: (event) => {
+              if (event.status === "progress" && Number.isFinite(event.progress)) {
+                progress.hidden = false;
+                progress.value = event.progress;
+                status.textContent = `Downloading model: ${Math.round(event.progress)}%`;
+              } else if (event.status === "download") {
+                progress.hidden = false;
+                progress.value = 0;
+                status.textContent = "Downloading Whisper model…";
+              }
+            }
+          });
+        })();
+      }
+
+      return transcriberPromise;
+    }
+
+    async function decodeAndResample(file) {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextClass) throw new Error("This browser does not support audio processing.");
+
+      const context = new AudioContextClass();
+      try {
+        const decoded = await context.decodeAudioData(await file.arrayBuffer());
+        const targetRate = 16000;
+        const outputLength = Math.ceil(decoded.duration * targetRate);
+        const mono = new Float32Array(outputLength);
+
+        for (let i = 0; i < outputLength; i++) {
+          const sourcePosition = i * decoded.sampleRate / targetRate;
+          const leftIndex = Math.floor(sourcePosition);
+          const fraction = sourcePosition - leftIndex;
+          let sample = 0;
+
+          for (let channel = 0; channel < decoded.numberOfChannels; channel++) {
+            const data = decoded.getChannelData(channel);
+            const first = data[Math.min(leftIndex, data.length - 1)] || 0;
+            const second = data[Math.min(leftIndex + 1, data.length - 1)] || 0;
+            sample += first + (second - first) * fraction;
+          }
+
+          mono[i] = sample / decoded.numberOfChannels;
+        }
+
+        return mono;
+      } finally {
+        await context.close();
+      }
+    }
+
+    button.addEventListener("click", async () => {
+      const file = fileInput.files?.[0];
+      if (!file) return;
+
+      button.disabled = true;
+      progress.hidden = true;
+      progress.value = 0;
+      status.classList.remove("error");
+      transcript.value = "";
+
+      try {
+        status.textContent = "Loading Whisper…";
+        const transcriber = await getTranscriber();
+
+        status.textContent = "Preparing audio…";
+        const audio = await decodeAndResample(file);
+
+        status.textContent = "Transcribing locally… This may take a while.";
+        const result = await transcriber(audio, {
+          chunk_length_s: 30,
+          stride_length_s: 5
+        });
+
+        transcript.value = result.text?.trim() || "No speech was detected.";
+        status.textContent = "Transcription complete.";
+        progress.hidden = true;
+      } catch (error) {
+        console.error(error);
+        status.textContent = error?.message || "Transcription failed.";
+        status.classList.add("error");
+        transcriberPromise = undefined;
+      } finally {
+        button.disabled = !fileInput.files?.length;
+      }
+    });
+  </script>
+</body>
+</html>
