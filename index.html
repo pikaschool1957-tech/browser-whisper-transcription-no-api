@@ -16,14 +16,14 @@
     #stop-recording{background:#ffaaa8}button:disabled{opacity:.5;cursor:not-allowed}
     #status{min-height:1.6em;margin:16px 0 8px;font-size:.95rem}#status.error{color:#ffaaa8}#status.success{color:#9ce0bf}
     progress{width:100%;height:8px;accent-color:#9ce0bf}textarea{width:100%;min-height:220px;margin-top:12px;padding:14px;resize:vertical;border:1px solid #30394c;border-radius:10px;background:#10131a;color:#eef1f8;font:inherit;line-height:1.6}
-    .note{margin-top:20px;font-size:.85rem}
+    audio{display:block;width:100%;margin:16px 0}audio[hidden]{display:none}.note{margin-top:20px;font-size:.85rem}
   </style>
 </head>
 <body>
   <main>
     <span class="tag">Private by design · Runs in your browser</span>
     <h1>Browser Whisper Transcription</h1>
-    <p>Record with your microphone and transcribe with Whisper on this device. Your audio is not sent to a transcription API. The model downloads the first time you use it.</p>
+    <p>Record with your microphone, listen back, and transcribe with Whisper on this device. Audio is not sent to a transcription API. The model downloads the first time you use it.</p>
 
     <div class="controls">
       <button id="start-recording" type="button">Start microphone</button>
@@ -32,9 +32,11 @@
 
     <p id="status" role="status" aria-live="polite">Ready. Select Start microphone and allow access.</p>
     <progress id="progress" value="0" max="100" hidden></progress>
+    <label for="recording-playback"><strong>Recording playback</strong></label>
+    <audio id="recording-playback" controls hidden></audio>
     <label for="transcript"><strong>Transcript</strong></label>
     <textarea id="transcript" placeholder="Your transcript will appear here after recording…" spellcheck="false"></textarea>
-    <p class="note">Microphone access requires HTTPS or localhost. The model is downloaded from Hugging Face; transcription runs locally in your browser. Short recordings work best, especially on phones.</p>
+    <p class="note">Microphone access requires HTTPS or localhost. The model is downloaded from Hugging Face; transcription runs locally in your browser. Try a short recording first.</p>
   </main>
 
   <script type="module">
@@ -43,6 +45,7 @@
     const status = document.querySelector("#status");
     const progress = document.querySelector("#progress");
     const transcript = document.querySelector("#transcript");
+    const playback = document.querySelector("#recording-playback");
 
     let transcriberPromise;
     let stream;
@@ -54,6 +57,7 @@
     let recordingStartedAt = 0;
     let recordingTimer;
     let inferenceTimer;
+    let playbackUrl;
 
     function setStatus(message, state = "") {
       status.textContent = message;
@@ -61,16 +65,15 @@
       status.classList.toggle("success", state === "success");
     }
 
-    function stopStatusTimers() {
-      clearInterval(recordingTimer);
-      clearInterval(inferenceTimer);
-      recordingTimer = undefined;
-      inferenceTimer = undefined;
+    function formatElapsed(start) {
+      const seconds = Math.floor((Date.now() - start) / 1000);
+      return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
     }
 
     async function releaseMicrophone() {
       recording = false;
-      stopStatusTimers();
+      clearInterval(recordingTimer);
+      recordingTimer = undefined;
       if (processor) {
         processor.onaudioprocess = null;
         processor.disconnect();
@@ -82,18 +85,14 @@
       }
       stream?.getTracks().forEach((track) => track.stop());
       stream = undefined;
-      if (audioContext && audioContext.state !== "closed") {
-        await audioContext.close();
-      }
+      if (audioContext && audioContext.state !== "closed") await audioContext.close();
       audioContext = undefined;
     }
 
     async function getTranscriber() {
       if (!transcriberPromise) {
         transcriberPromise = (async () => {
-          const { pipeline, env } = await import(
-            "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3"
-          );
+          const { pipeline, env } = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@3");
           env.allowLocalModels = false;
           return pipeline("automatic-speech-recognition", "Xenova/whisper-tiny", {
             progress_callback: (event) => {
@@ -118,7 +117,7 @@
 
     function combineAudioBuffers(buffers) {
       const totalLength = buffers.reduce((sum, buffer) => sum + buffer.length, 0);
-      if (!totalLength) throw new Error("No microphone audio was captured. Check your microphone and try again.");
+      if (!totalLength) throw new Error("No microphone audio was captured. Check the microphone and try again.");
       const combined = new Float32Array(totalLength);
       let offset = 0;
       for (const buffer of buffers) {
@@ -143,17 +142,38 @@
       return output;
     }
 
-    function formatElapsed(start) {
-      const seconds = Math.floor((Date.now() - start) / 1000);
-      return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+    function makeWavBlob(samples, sampleRate) {
+      const wav = new ArrayBuffer(44 + samples.length * 2);
+      const view = new DataView(wav);
+      const writeText = (offset, text) => {
+        for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
+      };
+      writeText(0, "RIFF");
+      view.setUint32(4, 36 + samples.length * 2, true);
+      writeText(8, "WAVE");
+      writeText(12, "fmt ");
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeText(36, "data");
+      view.setUint32(40, samples.length * 2, true);
+      for (let i = 0; i < samples.length; i++) {
+        const sample = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(44 + i * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+      }
+      return new Blob([wav], { type: "audio/wav" });
     }
 
     async function transcribe(audio) {
       try {
-        setStatus("Loading Whisper runtime and model… The first use can take a few minutes.");
+        setStatus("Loading Whisper runtime and model… The first use may take a few minutes.");
         const transcriber = await getTranscriber();
         progress.hidden = true;
-        setStatus("Whisper is ready. Transcribing locally… Please wait; this can take longer than the recording.");
+        setStatus("Whisper is ready. Transcribing locally… Please keep this page open.");
         const startedAt = Date.now();
         inferenceTimer = setInterval(() => {
           setStatus(`Transcribing locally… ${formatElapsed(startedAt)} elapsed. Please keep this page open.`);
@@ -164,15 +184,12 @@
         inferenceTimer = undefined;
         const text = typeof result?.text === "string" ? result.text.trim() : "";
         transcript.value = text;
-        if (text) {
-          setStatus("Transcription complete.", "success");
-        } else {
-          setStatus("Transcription finished, but no speech was detected. Try speaking closer to the microphone.");
-        }
+        if (text) setStatus("Success — transcription complete.", "success");
+        else setStatus("Finished, but no speech was detected. Play the recording to check the microphone audio.");
       } catch (error) {
         console.error("Whisper transcription failed:", error);
         transcriberPromise = undefined;
-        setStatus(`Transcription failed: ${error?.message || String(error)}. Check your internet connection and browser console, then try a short recording.`, "error");
+        setStatus(`Failed — transcription error: ${error?.message || String(error)}`, "error");
       } finally {
         clearInterval(inferenceTimer);
         inferenceTimer = undefined;
@@ -184,12 +201,12 @@
 
     startButton.addEventListener("click", async () => {
       if (!navigator.mediaDevices?.getUserMedia) {
-        setStatus("This browser does not support microphone access. Try a current browser over HTTPS.", "error");
+        setStatus("Microphone access is not available in this browser. Use a current browser over HTTPS.", "error");
         return;
       }
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
       if (!AudioContextClass || !AudioContextClass.prototype.createScriptProcessor) {
-        setStatus("This browser does not support microphone audio capture needed by this page.", "error");
+        setStatus("This browser does not support microphone audio capture required by this page.", "error");
         return;
       }
       if (!window.isSecureContext) {
@@ -216,6 +233,10 @@
         recording = true;
         recordingStartedAt = Date.now();
         transcript.value = "";
+        playback.pause();
+        playback.hidden = true;
+        if (playbackUrl) URL.revokeObjectURL(playbackUrl);
+        playbackUrl = undefined;
         stopButton.disabled = false;
         setStatus("Recording… Speak clearly, then select Stop & transcribe.");
         recordingTimer = setInterval(() => {
@@ -227,18 +248,18 @@
         startButton.disabled = false;
         stopButton.disabled = true;
         const message = error?.name === "NotAllowedError"
-          ? "Microphone permission was denied. Allow microphone access in browser settings and try again."
+          ? "Microphone permission denied. Allow microphone access in browser settings and try again."
           : error?.name === "NotFoundError"
             ? "No microphone was found. Connect a microphone and try again."
-            : error?.message || "Could not start the microphone.";
-        setStatus(message, "error");
+            : error?.message || String(error);
+        setStatus(`Failed — could not start microphone: ${message}`, "error");
       }
     });
 
     stopButton.addEventListener("click", async () => {
       if (!recording || !audioContext) return;
       stopButton.disabled = true;
-      setStatus("Stopping the microphone and preparing audio…");
+      setStatus("Stopping recording and preparing audio…");
       recording = false;
       clearInterval(recordingTimer);
       recordingTimer = undefined;
@@ -247,21 +268,26 @@
         const captured = combineAudioBuffers(audioBuffers);
         audioBuffers = [];
         await releaseMicrophone();
-        setStatus("Preparing audio for Whisper…");
         const audio16k = resampleTo16kHz(captured, sampleRate);
+        playbackUrl = URL.createObjectURL(makeWavBlob(audio16k, 16000));
+        playback.src = playbackUrl;
+        playback.hidden = false;
+        setStatus("Recording captured. Use the player to listen while Whisper transcribes.");
         await transcribe(audio16k);
       } catch (error) {
         console.error("Audio preparation failed:", error);
         await releaseMicrophone();
         startButton.disabled = false;
         stopButton.disabled = true;
-        setStatus(`Could not prepare recording: ${error?.message || String(error)}`, "error");
+        setStatus(`Failed — could not prepare recording: ${error?.message || String(error)}`, "error");
       }
     });
 
     window.addEventListener("pagehide", () => {
-      stopStatusTimers();
+      clearInterval(recordingTimer);
+      clearInterval(inferenceTimer);
       stream?.getTracks().forEach((track) => track.stop());
+      if (playbackUrl) URL.revokeObjectURL(playbackUrl);
     });
   </script>
 </body>
